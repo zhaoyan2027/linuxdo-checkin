@@ -1,3 +1,253 @@
+"""
+cron: 0 */6 * * *
+new Env("Linux.Do 签到")
+"""
+
+import os
+import random
+import time
+import functools
+from loguru import logger
+from DrissionPage import ChromiumOptions, Chromium
+from tabulate import tabulate
+from curl_cffi import requests
+from bs4 import BeautifulSoup
+from notify import NotificationManager
+
+
+def retry_decorator(retries=3, min_delay=5, max_delay=10):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == retries - 1:  # 最后一次尝试
+                        logger.error(f"函数 {func.__name__} 最终执行失败: {str(e)}")
+                    logger.warning(
+                        f"函数 {func.__name__} 第 {attempt + 1}/{retries} 次尝试失败: {str(e)}"
+                    )
+                    if attempt < retries - 1:
+                        sleep_s = random.uniform(min_delay, max_delay)
+                        logger.info(
+                            f"将在 {sleep_s:.2f}s 后重试 ({min_delay}-{max_delay}s 随机延迟)"
+                        )
+                        time.sleep(sleep_s)
+            return None
+
+        return wrapper
+
+    return decorator
+
+
+os.environ.pop("DISPLAY", None)
+os.environ.pop("DYLD_LIBRARY_PATH", None)
+
+USERNAME = os.environ.get("LINUXDO_USERNAME")
+PASSWORD = os.environ.get("LINUXDO_PASSWORD")
+COOKIES = os.environ.get("LINUXDO_COOKIES", "").strip()  # 手动设置的 Cookie 字符串，优先使用
+BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
+    "false",
+    "0",
+    "off",
+]
+if not USERNAME:
+    USERNAME = os.environ.get("USERNAME")
+if not PASSWORD:
+    PASSWORD = os.environ.get("PASSWORD")
+
+HOME_URL = "https://linux.do/"
+LOGIN_URL = "https://linux.do/login"
+SESSION_URL = "https://linux.do/session"
+CSRF_URL = "https://linux.do/session/csrf"
+
+
+class LinuxDoBrowser:
+    def __init__(self) -> None:
+        from sys import platform
+
+        if platform == "linux" or platform == "linux2":
+            platformIdentifier = "X11; Linux x86_64"
+        elif platform == "darwin":
+            platformIdentifier = "Macintosh; Intel Mac OS X 10_15_7"
+        elif platform == "win32":
+            platformIdentifier = "Windows NT 10.0; Win64; x64"
+        else:
+            platformIdentifier = "X11; Linux x86_64"
+
+        co = (
+            ChromiumOptions()
+            .headless(True)
+            .incognito(True)
+            .set_argument("--no-sandbox")
+        )
+        co.set_user_agent(
+            f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        )
+        self.browser = Chromium(co)
+        self.page = self.browser.new_tab()
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+            }
+        )
+        # 初始化通知管理器
+        self.notifier = NotificationManager()
+
+    @staticmethod
+    def parse_cookie_string(cookie_str: str) -> list[dict]:
+        """
+        解析浏览器复制的 Cookie 字符串格式: "name1=value1; name2=value2"
+        返回 DrissionPage 所需的 cookie 列表格式。
+        """
+        cookies = []
+        for part in cookie_str.strip().split(";"):
+            part = part.strip()
+            if "=" in part:
+                name, _, value = part.partition("=")
+                cookies.append(
+                    {
+                        "name": name.strip(),
+                        "value": value.strip(),
+                        "domain": ".linux.do",
+                        "path": "/",
+                    }
+                )
+        return cookies
+
+    def login_with_cookies(self, cookie_str: str) -> bool:
+        """使用手动设置的 Cookie 直接登录，跳过账号密码流程"""
+        logger.info("检测到手动 Cookie，尝试 Cookie 登录...")
+        dp_cookies = self.parse_cookie_string(cookie_str)
+        if not dp_cookies:
+            logger.error("Cookie 解析失败或为空，无法使用 Cookie 登录")
+            return False
+
+        logger.info(f"成功解析 {len(dp_cookies)} 个 Cookie 条目")
+
+        # 同步到 requests.Session，以便后续 API 请求（如 print_connect_info）使用
+        for ck in dp_cookies:
+            self.session.cookies.set(ck["name"], ck["value"], domain="linux.do")
+
+        # 同步到 DrissionPage
+        self.page.set.cookies(dp_cookies)
+        logger.info("Cookie 设置完成，导航至 linux.do...")
+        self.page.get(HOME_URL)
+        time.sleep(5)
+
+        # 验证登录状态
+        try:
+            user_ele = self.page.ele("@id=current-user")
+        except Exception as e:
+            logger.warning(f"Cookie 登录验证异常: {str(e)}")
+            return True
+        if not user_ele:
+            if "avatar" in self.page.html:
+                logger.info("Cookie 登录验证成功 (通过 avatar)")
+                return True
+            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
+            return False
+        else:
+            logger.info("Cookie 登录验证成功")
+            return True
+
+    def login(self):
+        logger.info("开始账号密码登录")
+        # Step 1: Get CSRF Token
+        logger.info("获取 CSRF token...")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": LOGIN_URL,
+        }
+        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="firefox135")
+        if resp_csrf.status_code != 200:
+            logger.error(f"获取 CSRF token 失败: {resp_csrf.status_code}")
+            return False        
+        csrf_data = resp_csrf.json()
+        csrf_token = csrf_data.get("csrf")
+        logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
+
+        # Step 2: Login
+        logger.info("正在登录...")
+        headers.update(
+            {
+                "X-CSRF-Token": csrf_token,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": "https://linux.do",
+            }
+        )
+
+        data = {
+            "login": USERNAME,
+            "password": PASSWORD,
+            "second_factor_method": "1",
+            "timezone": "Asia/Shanghai",
+        }
+
+        try:
+            resp_login = self.session.post(
+                SESSION_URL, data=data, impersonate="chrome136", headers=headers
+            )
+
+            if resp_login.status_code == 200:
+                response_json = resp_login.json()
+                if response_json.get("error"):
+                    logger.error(f"登录失败: {response_json.get('error')}")
+                    return False
+                logger.info("登录成功!")
+            else:
+                logger.error(f"登录失败，状态码: {resp_login.status_code}")
+                logger.error(resp_login.text)
+                return False
+        except Exception as e:
+            logger.error(f"登录请求异常: {e}")
+            return False
+
+        # Step 3: Pass cookies to DrissionPage
+        logger.info("同步 Cookie 到 DrissionPage...")
+
+        cookies_dict = self.session.cookies.get_dict()
+
+        dp_cookies = []
+        for name, value in cookies_dict.items():
+            dp_cookies.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": ".linux.do",
+                    "path": "/",
+                }
+            )
+
+        self.page.set.cookies(dp_cookies)
+
+        logger.info("Cookie 设置完成，导航至 linux.do...")
+        self.page.get(HOME_URL)
+
+        time.sleep(5)
+        try:
+            user_ele = self.page.ele("@id=current-user")
+        except Exception as e:
+            logger.warning(f"登录验证失败: {str(e)}")
+            return True
+        if not user_ele:
+            # Fallback check for avatar
+            if "avatar" in self.page.html:
+                logger.info("登录验证成功 (通过 avatar)")
+                return True
+            logger.error("登录验证失败 (未找到 current-user)")
+            return False
+        else:
+            logger.info("登录验证成功")
+            return True
+
     def click_topic(self):
         topic_list = self.page.ele("@id=list-area").eles(".:title")
         if not topic_list:
@@ -54,20 +304,16 @@
 
     def run(self):
         try:
-            # 优先使用手动 Cookie 登录
-            # 如果设置了 Cookie，就只走 Cookie，不再自动回退到账号密码登录
+            # 优先使用手动 Cookie 登录，没有再使用账号密码
             if COOKIES:
                 login_res = self.login_with_cookies(COOKIES)
                 if not login_res:
-                    logger.warning("Cookie 登录失败，请刷新 LINUXDO_COOKIES 后重试")
-                    return
+                    logger.warning("Cookie 登录失败，尝试账号密码登录...")
+                    login_res = self.login()
             else:
                 login_res = self.login()
-
-            # 登录失败时直接退出，避免继续执行后续浏览逻辑导致报错
-            if not login_res:
+            if not login_res:  # 登录
                 logger.warning("登录验证失败")
-                return
 
             if BROWSE_ENABLED:
                 click_topic_res = self.click_topic()  # 点击主题
@@ -75,12 +321,8 @@
                     logger.error("点击主题失败，程序终止")
                     return
                 logger.info("完成浏览任务")
-            else:
-                logger.info("已禁用浏览任务，仅执行登录校验")
-
             self.print_connect_info()  # 打印连接信息
             self.send_notifications(BROWSE_ENABLED)  # 发送通知
-
         finally:
             try:
                 self.page.close()
