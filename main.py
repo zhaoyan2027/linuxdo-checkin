@@ -303,35 +303,43 @@ class LinuxDoBrowser:
             time.sleep(wait_time)
 
     def run(self):
-        try:
-            # 优先使用手动 Cookie 登录，没有再使用账号密码
-            if COOKIES:
-                login_res = self.login_with_cookies(COOKIES)
-                if not login_res:
-                    logger.warning("Cookie 登录失败，尝试账号密码登录...")
-                    login_res = self.login()
-            else:
-                login_res = self.login()
-            if not login_res:  # 登录
-                logger.warning("登录验证失败")
+    try:
+        # 优先使用手动 Cookie 登录
+        # 如果设置了 Cookie，就只走 Cookie，不再自动回退到账号密码登录
+        if COOKIES:
+            login_res = self.login_with_cookies(COOKIES)
+            if not login_res:
+                logger.warning("Cookie 登录失败，请刷新 LINUXDO_COOKIES 后重试")
+                return
+        else:
+            login_res = self.login()
 
-            if BROWSE_ENABLED:
-                click_topic_res = self.click_topic()  # 点击主题
-                if not click_topic_res:
-                    logger.error("点击主题失败，程序终止")
-                    return
-                logger.info("完成浏览任务")
-            self.print_connect_info()  # 打印连接信息
-            self.send_notifications(BROWSE_ENABLED)  # 发送通知
-        finally:
-            try:
-                self.page.close()
-            except Exception:
-                pass
-            try:
-                self.browser.quit()
-            except Exception:
-                pass
+        # 登录失败时直接退出，避免继续执行后续浏览逻辑导致报错
+        if not login_res:
+            logger.warning("登录验证失败")
+            return
+
+        if BROWSE_ENABLED:
+            click_topic_res = self.click_topic()  # 点击主题
+            if not click_topic_res:
+                logger.error("点击主题失败，程序终止")
+                return
+            logger.info("完成浏览任务")
+        else:
+            logger.info("已禁用浏览任务，仅执行登录校验")
+
+        self.print_connect_info()  # 打印连接信息
+        self.send_notifications(BROWSE_ENABLED)  # 发送通知
+
+    finally:
+        try:
+            self.page.close()
+        except Exception:
+            pass
+        try:
+            self.browser.quit()
+        except Exception:
+            pass
 
     def click_like(self, page):
         try:
